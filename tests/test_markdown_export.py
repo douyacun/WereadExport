@@ -1,9 +1,14 @@
 import os
+import base64
+from io import BytesIO
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from urllib.parse import quote
+from urllib.parse import quote, unquote
+from time import sleep
+
+from PIL import Image
 
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.common.by import By
@@ -68,6 +73,7 @@ class MarkdownBrowserTest(unittest.TestCase):
         class FixtureChrome(Chrome):
             def get(self, url):
                 super().get('data:text/html;charset=utf-8,' + quote(getattr(self, 'fixture', FIXTURE)))
+                sleep(getattr(self, 'load_delay', 0))
         options = ChromeOptions()
         options.add_argument('--headless=new')
         cls.driver = FixtureChrome(options=options)
@@ -131,6 +137,42 @@ class MarkdownBrowserTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 path = export_markdown(self.reader(), 'https://weread.qq.com/web/reader/test', directory)
                 self.assertIn('终章正文', path.read_text(encoding='utf-8'))
+        finally:
+            del self.driver.fixture
+
+    def test_prefetched_text_does_not_discard_earlier_images(self):
+        buffer = BytesIO()
+        Image.new('RGB', (3, 3), 'blue').save(buffer, format='PNG')
+        source = 'data:image/png;base64,' + base64.b64encode(buffer.getvalue()).decode()
+        original = "setTimeout(() => chapter('<h1>第一章</h1><p><span>中</span><span>文</span>正文</p>'), 50);"
+        replacement = "setTimeout(() => { chapter('<h1>第一章</h1><img src=\"" + source + "\"><img src=\"" + source + "\">'); setTimeout(() => chapter('<p>预加载的后续正文</p>'), 10); }, 50);"
+        self.driver.fixture = FIXTURE.replace(original, replacement)
+        self.driver.load_delay = .3
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = export_markdown(self.reader(), 'https://weread.qq.com/web/reader/test', directory)
+                text = path.read_text(encoding='utf-8')
+                import re
+                references = re.findall(r'!\[[^\]]*\]\(([^)]+)\)', text)
+                self.assertEqual(len(references), 2)
+                self.assertEqual(len(set(references)), 1)
+                self.assertIn('预加载的后续正文', text)
+                image_path = Path(directory) / unquote(references[0])
+                self.assertEqual(image_path.read_bytes(), buffer.getvalue())
+        finally:
+            del self.driver.fixture
+            del self.driver.load_delay
+
+    def test_failed_image_keeps_partial_and_previous_complete_export(self):
+        self.driver.fixture = FIXTURE.replace('<h1>第一章</h1>', '<h1>第一章</h1><img src="data:text/html,not-an-image">')
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / '测试书.md'
+                target.write_text('previous export', encoding='utf-8')
+                with self.assertRaisesRegex(RuntimeError, '图片保存失败'):
+                    export_markdown(self.reader(), 'https://weread.qq.com/web/reader/test', directory)
+                self.assertEqual(target.read_text(encoding='utf-8'), 'previous export')
+                self.assertIn('尚未完成', (Path(directory) / '测试书.partial.md').read_text(encoding='utf-8'))
         finally:
             del self.driver.fixture
 

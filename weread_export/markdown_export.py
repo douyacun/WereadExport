@@ -19,10 +19,14 @@ logger = logging.getLogger(__name__)
 CAPTURE_SCRIPT = r"""
 (() => {
     window.__wrsMarkdown = null;
+    window.__wrsMarkdownQueue = [];
     const capture = () => {
         const node = document.querySelector('#preRenderContent');
-        if (!node || (!node.textContent.trim() && !node.querySelector('img'))) return;
-        window.__wrsMarkdown = {html: node.innerHTML, url: location.href};
+        if (!node || (!node.textContent.trim() && !node.querySelector('img,svg image'))) return;
+        const html = node.innerHTML;
+        if (window.__wrsMarkdown?.html === html) return;
+        window.__wrsMarkdown = {html, url: location.href};
+        window.__wrsMarkdownQueue.push(window.__wrsMarkdown);
     };
     new MutationObserver(capture).observe(document, {
         childList: true, subtree: true, characterData: true
@@ -32,15 +36,24 @@ CAPTURE_SCRIPT = r"""
 """
 
 
-def html_to_markdown(html, base_url):
-    """Keep semantic text, tables and image links; discard reader styling."""
+def html_to_markdown(html, base_url, image_store=None):
+    """Keep semantic content and optionally save linked images locally."""
     soup = BeautifulSoup(html, 'html.parser')
     for node in soup.select('script, style, noscript, [data-wr-ignore="1"]'):
         node.decompose()
+    for node in soup.select('svg image'):
+        image = soup.new_tag('img')
+        image['src'] = node.get('href') or node.get('xlink:href', '')
+        image['alt'] = node.get('aria-label', '')
+        node.replace_with(image)
     for node in soup.select('img'):
-        src = node.get('src') or node.get('data-src')
+        src = node.get('data-src') or node.get('data-original') or node.get('src')
+        if not src and node.get('srcset'):
+            src = node['srcset'].split(',')[-1].strip().split()[0]
         if src:
-            node['src'] = urljoin(base_url, src)
+            node['src'] = image_store.save(src, base_url) if image_store else urljoin(base_url, src)
+        elif image_store:
+            raise RuntimeError('正文图片缺少图片地址，停止导出以避免缺图')
     for node in soup.select('a[href]'):
         node['href'] = urljoin(base_url, node['href'])
     # The book owns H1; chapter headings start at H2.
@@ -105,7 +118,8 @@ def _start_from_first_chapter(driver, wait):
     driver.execute_script("""const area = document.querySelector('.readerCatalog_list_scroll_area');
         if (area) area.scrollTop = 0;
         arguments[0].scrollIntoView({block:'nearest'});
-        window.__wrsMarkdown = null;""", first)
+        window.__wrsMarkdown = null;
+        window.__wrsMarkdownQueue = [];""", first)
     first.click()
     wait.until(lambda d: not visible(d, '.readerCatalog'))
     wait.until(lambda d: d.execute_script('return window.__wrsMarkdown'))
@@ -142,6 +156,8 @@ def export_markdown(weread, book_url, save_at='.', max_pages=10000, from_start=F
         filename = escape(title).strip('. ') or '微信读书'
         output = Path(save_at)
         output.mkdir(parents=True, exist_ok=True)
+        from .image_store import ImageStore
+        images = ImageStore(driver, output, filename)
         target = output / f'{filename}.md'
         partial = output / f'{filename}.partial.md'
         safe_title = title.replace('\n', ' ').replace('#', r'\#')
@@ -153,17 +169,23 @@ def export_markdown(weread, book_url, save_at='.', max_pages=10000, from_start=F
             partial.write_text(header + '> 导出尚未完成，以下仅为已读取内容。\n\n'
                                + '\n\n'.join(sections) + '\n', encoding='utf-8')
 
+        save_partial()
         for page in range(1, max_pages + 1):
-            snapshot = driver.execute_script('return window.__wrsMarkdown')
-            body = html_to_markdown(snapshot['html'], snapshot['url'])
-            if not body:
-                raise RuntimeError('当前章节没有可转换的文本，可能是图片书或页面结构已变化')
-            fingerprint = hashlib.sha256((snapshot['url'] + body).encode()).hexdigest()
-            if fingerprint not in seen:
-                seen.add(fingerprint)
-                sections.append(body)
-                save_partial()
-                logger.info('Markdown：已保存 %s 段章节内容（第 %s 页）', len(sections), page)
+            snapshots = driver.execute_script("""
+                const queue = window.__wrsMarkdownQueue;
+                return queue?.length ? queue.splice(0) : [window.__wrsMarkdown].filter(Boolean);
+            """)
+            for snapshot in snapshots:
+                phase = f'第 {page} 页转换正文及下载图片'
+                body = html_to_markdown(snapshot['html'], snapshot['url'], image_store=images)
+                if not body:
+                    raise RuntimeError('当前章节没有可转换的正文内容，页面结构可能已变化')
+                fingerprint = hashlib.sha256((snapshot['url'] + body).encode()).hexdigest()
+                if fingerprint not in seen:
+                    seen.add(fingerprint)
+                    sections.append(body)
+                    save_partial()
+                    logger.info('Markdown：已保存 %s 段章节内容（第 %s 页）', len(sections), page)
 
             endings = driver.execute_script(
                 "return [...document.querySelectorAll('.readerFooter_ending')]"
@@ -172,6 +194,7 @@ def export_markdown(weread, book_url, save_at='.', max_pages=10000, from_start=F
                 partial.write_text(header + '\n\n'.join(sections) + '\n', encoding='utf-8')
                 partial.replace(target)
                 print(f'Markdown 导出完成：{target.resolve()}', flush=True)
+                logger.info('已保存 %s 张本地图片，目录：%s', len(images.files), images.directory.resolve())
                 return target
 
             candidates = driver.execute_script("""return [...document.querySelectorAll(
