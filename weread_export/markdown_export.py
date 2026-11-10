@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from markdownify import markdownify
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.wait import WebDriverWait
+from .pacing import PagePacer
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,7 @@ def export_markdown(weread, book_url, save_at='.', max_pages=10000, from_start=F
         header = f'# {safe_title}\n\n来源：<{book_url}>\n\n'
         sections = []
         seen = set()
+        pacer = PagePacer()
 
         def save_partial():
             partial.write_text(header + '> 导出尚未完成，以下仅为已读取内容。\n\n'
@@ -187,6 +189,8 @@ def export_markdown(weread, book_url, save_at='.', max_pages=10000, from_start=F
                     save_partial()
                     logger.info('Markdown：已保存 %s 段章节内容（第 %s 页）', len(sections), page)
 
+            pacer.page_processed()
+
             endings = driver.execute_script(
                 "return [...document.querySelectorAll('.readerFooter_ending')]"
             )
@@ -206,6 +210,8 @@ def export_markdown(weread, book_url, save_at='.', max_pages=10000, from_start=F
                 raise RuntimeError('没有找到可用的下一页或结束标记，可能需要登录、解锁章节或适配页面')
             if page == max_pages:
                 raise RuntimeError(f'达到 --max-pages={max_pages} 页上限，尚未确认书籍结束')
+            phase = f'第 {page} 页翻页前节流等待'
+            pacer.before_turn()
             signature = _page_signature(driver)
             phase = f'第 {page} 页点击“{next_button.text.strip()}”后等待画面变化'
             logger.info('Markdown：第 %s 页，点击“%s”', page, next_button.text.strip())

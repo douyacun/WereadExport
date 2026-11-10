@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from urllib.parse import quote, unquote
 from time import sleep
 
@@ -70,6 +71,10 @@ class MarkdownConversionTest(unittest.TestCase):
 class MarkdownBrowserTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Test the local reader without spending real minutes on pacing.
+        cls.pacing_patch = patch('weread_export.markdown_export.PagePacer')
+        cls.pacer_factory = cls.pacing_patch.start()
+        cls.addClassCleanup(cls.pacing_patch.stop)
         class FixtureChrome(Chrome):
             def get(self, url):
                 super().get('data:text/html;charset=utf-8,' + quote(getattr(self, 'fixture', FIXTURE)))
@@ -77,6 +82,9 @@ class MarkdownBrowserTest(unittest.TestCase):
         options = ChromeOptions()
         options.add_argument('--headless=new')
         cls.driver = FixtureChrome(options=options)
+
+    def setUp(self):
+        self.pacer_factory.reset_mock()
 
     @classmethod
     def tearDownClass(cls):
@@ -95,6 +103,9 @@ class MarkdownBrowserTest(unittest.TestCase):
             self.assertIn('终章正文', text)
             self.assertNotIn('尚未完成', text)
             self.assertFalse(list(Path(directory).glob('*.partial.md')))
+            pacer = self.pacer_factory.return_value
+            self.assertEqual(pacer.page_processed.call_count, 4)
+            self.assertEqual(pacer.before_turn.call_count, 3)
 
     def test_page_limit_keeps_partial_and_preserves_previous_export(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +117,7 @@ class MarkdownBrowserTest(unittest.TestCase):
             partial = Path(directory) / '测试书.partial.md'
             self.assertIn('尚未完成', partial.read_text(encoding='utf-8'))
             self.assertIn('中文正文', partial.read_text(encoding='utf-8'))
+            self.pacer_factory.return_value.before_turn.assert_not_called()
 
     def test_catalog_reset_does_not_export_restored_middle_position(self):
         catalog = '''<button class="catalog" onclick="document.querySelector('.readerCatalog').style.display='block'">目录</button>

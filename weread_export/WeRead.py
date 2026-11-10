@@ -12,6 +12,7 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.common.exceptions import TimeoutException
 
 from .script import img2pdf, dir_check, os_start_file, clear_temp, escape
+from .pacing import PagePacer
 
 from time import sleep
 from time import monotonic
@@ -252,6 +253,7 @@ class WeRead:
         png_name_list = []
 
         page = 1
+        pacer = PagePacer()
 
         while True:
             sleep(1)
@@ -271,6 +273,7 @@ class WeRead:
             self.shot_full_canvas_context(f'{png_name}.png')
 
             png_name_list.append(png_name)
+            pacer.page_processed()
             print(f'save chapter scan {png_name}')
 
             # find next page or chapter button
@@ -298,6 +301,7 @@ class WeRead:
                 raise Exception("Unexpected Exception")
 
             # go to next page or chapter
+            pacer.before_turn()
             readerFooter.click()
 
         print('pdf converting...')
